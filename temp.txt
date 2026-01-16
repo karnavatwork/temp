@@ -317,3 +317,122 @@ if __name__ == "__main__":
     # print(results["table_summary"])
     # print(results["column_profile"].head(25))
     pass
+
+
+1️⃣ Use your existing pyodbc connection (unchanged login)
+import pyodbc
+
+conn = pyodbc.connect(
+    f"DSN=DatalakeImpala;Schema=analyticsdb;UID={username};PWD={password}",
+    autocommit=True
+)
+
+cursor = conn.cursor()
+
+
+We’ll reuse conn directly for pandas reads.
+
+2️⃣ Replace SQLAlchemy with a pyodbc-based SQLSource
+
+Here is a Impala-safe SQLSource that works with pyodbc + pandas.
+
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class ImpalaSQLSource:
+    """
+    SQL source backed by a pyodbc Impala connection
+    """
+    conn: pyodbc.Connection
+    table: Optional[str] = None
+    query: Optional[str] = None
+
+    def base_sql(self) -> str:
+        if self.query:
+            return f"({self.query}) t"
+        if self.table:
+            return self.table
+        raise ValueError("Provide either table or query")
+
+    def sample_df(self, n: int = 100_000) -> pd.DataFrame:
+        """
+        Impala-friendly sampling:
+        - LIMIT only (ORDER BY RAND() is expensive in Impala)
+        """
+        sql = f"""
+        SELECT *
+        FROM {self.base_sql()}
+        LIMIT {n}
+        """
+        return pd.read_sql(sql, self.conn)
+
+    def row_count(self) -> int:
+        sql = f"""
+        SELECT COUNT(*) AS n
+        FROM {self.base_sql()}
+        """
+        return int(pd.read_sql(sql, self.conn).iloc[0, 0])
+
+    def missingness(self) -> pd.DataFrame:
+        """
+        Column-wise null counts pushed to Impala
+        """
+        # Get columns without scanning data
+        cols_sql = f"""
+        SELECT *
+        FROM {self.base_sql()}
+        LIMIT 0
+        """
+        cols = pd.read_sql(cols_sql, self.conn).columns.tolist()
+
+        null_exprs = [
+            f"SUM(CASE WHEN {c} IS NULL THEN 1 ELSE 0 END) AS {c}"
+            for c in cols
+        ]
+
+        sql = f"""
+        SELECT {", ".join(null_exprs)}
+        FROM {self.base_sql()}
+        """
+
+        nulls = pd.read_sql(sql, self.conn).iloc[0].to_frame("nulls")
+        nulls["col"] = nulls.index
+        nulls = nulls.reset_index(drop=True)[["col", "nulls"]]
+
+        total_rows = self.row_count()
+        nulls["pct_null"] = nulls["nulls"] / total_rows
+
+        return nulls.sort_values("pct_null", ascending=False)
+
+3️⃣ Updated example usage (Customer 360 table)
+👉 Table-based usage
+src = ImpalaSQLSource(
+    conn=conn,
+    table="analyticsdb.customer_360"
+)
+
+results = run_customer360_eda(
+    data=src,
+    sample_rows=200_000,
+    customer_id_col="customer_id"
+)
+
+👉 Query-based usage (recommended for filtering early)
+src = ImpalaSQLSource(
+    conn=conn,
+    query="""
+        SELECT *
+        FROM analyticsdb.customer_360
+        WHERE is_active = 1
+    """
+)
+
+results = run_customer360_eda(
+    data=src,
+    sample_rows=150_000,
+    customer_id_col="customer_id"
+)
