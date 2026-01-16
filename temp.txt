@@ -1,0 +1,319 @@
+"""
+Large-table-friendly EDA for a Customer 360 table
+- Works with: pandas DataFrame OR SQL table via SQLAlchemy
+- Strategy: sampling + pushdown aggregations (when SQL) + robust type/missing/cardinality checks
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
+
+import numpy as np
+import pandas as pd
+
+
+# ---------------------------
+# Helpers: formatting & types
+# ---------------------------
+
+def _is_probably_id(col: str) -> bool:
+    """Heuristic to identify ID-like columns by name."""
+    col_l = col.lower()
+    patterns = [r"\bid\b", r"_id\b", r"\bkey\b", r"\buid\b", r"\bcust\b", r"\bcustomer\b", r"\baccount\b"]
+    return any(re.search(p, col_l) for p in patterns)
+
+def _series_type_label(s: pd.Series) -> str:
+    if pd.api.types.is_bool_dtype(s):
+        return "bool"
+    if pd.api.types.is_numeric_dtype(s):
+        return "numeric"
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "datetime"
+    if pd.api.types.is_categorical_dtype(s):
+        return "category"
+    return "text"
+
+def _safe_value_counts(s: pd.Series, top_n: int = 10) -> pd.DataFrame:
+    vc = s.value_counts(dropna=False).head(top_n)
+    out = vc.reset_index()
+    out.columns = ["value", "count"]
+    out["pct"] = out["count"] / out["count"].sum()
+    return out
+
+def _approx_mem_mb(df: pd.DataFrame) -> float:
+    return float(df.memory_usage(deep=True).sum()) / (1024**2)
+
+
+# ---------------------------
+# Data source abstraction
+# ---------------------------
+
+@dataclass
+class SQLSource:
+    """
+    Wraps a SQLAlchemy engine/connection and a table or query.
+    Provide either:
+      - table="schema.table"
+      - query="SELECT ... FROM ..."
+    """
+    engine: Any  # sqlalchemy.Engine or Connection
+    table: Optional[str] = None
+    query: Optional[str] = None
+    schema: Optional[str] = None
+
+    def base_sql(self) -> str:
+        if self.query:
+            return f"({self.query}) AS t"
+        if self.table:
+            if self.schema and "." not in self.table:
+                return f"{self.schema}.{self.table}"
+            return self.table
+        raise ValueError("Provide either table or query.")
+
+    def sample_df(self, n: int = 100_000, seed: int = 42) -> pd.DataFrame:
+        """
+        Returns a sample as a pandas DataFrame.
+        Generic approach: ORDER BY random() (Postgres) is not portable.
+        Use a simple LIMIT for portability; for huge tables you may want db-specific sampling.
+        """
+        sql = f"SELECT * FROM {self.base_sql()} LIMIT {int(n)}"
+        return pd.read_sql(sql, self.engine)
+
+    def row_count(self) -> int:
+        sql = f"SELECT COUNT(*) AS n FROM {self.base_sql()}"
+        return int(pd.read_sql(sql, self.engine).iloc[0, 0])
+
+    def missingness(self) -> pd.DataFrame:
+        """
+        Null counts per column (pushdown). Uses information_schema not required; uses SUM(CASE WHEN col IS NULL THEN 1 END).
+        For wide tables this query can be big but still usually faster than pulling data.
+        """
+        # Fetch column names via a 0-row query
+        cols = pd.read_sql(f"SELECT * FROM {self.base_sql()} WHERE 1=0", self.engine).columns.tolist()
+        exprs = [f"SUM(CASE WHEN {c} IS NULL THEN 1 ELSE 0 END) AS {c}" for c in cols]
+        sql = f"SELECT {', '.join(exprs)} FROM {self.base_sql()}"
+        nulls = pd.read_sql(sql, self.engine).iloc[0].to_frame("nulls")
+        nulls["col"] = nulls.index
+        nulls = nulls.reset_index(drop=True)[["col", "nulls"]]
+        total = self.row_count()
+        nulls["pct_null"] = nulls["nulls"] / total if total else np.nan
+        return nulls.sort_values("pct_null", ascending=False)
+
+
+# ---------------------------
+# Core EDA for a pandas sample
+# ---------------------------
+
+def profile_dataframe(
+    df: pd.DataFrame,
+    *,
+    customer_id_col: Optional[str] = None,
+    top_n: int = 10,
+    infer_datetime: bool = True
+) -> Dict[str, Any]:
+    """
+    Profiles a DataFrame (ideally a sample of your big table).
+    Returns dict of summary tables: columns, numeric_stats, duplicates, top_values, etc.
+    """
+    out: Dict[str, Any] = {}
+
+    # Basic table summary
+    out["table_summary"] = pd.DataFrame([{
+        "rows": len(df),
+        "cols": df.shape[1],
+        "memory_mb_est": round(_approx_mem_mb(df), 2)
+    }])
+
+    # Optionally infer datetime for object columns that look like dates
+    if infer_datetime:
+        for c in df.select_dtypes(include=["object"]).columns:
+            # quick heuristic: try parse a small sample
+            sample = df[c].dropna().astype(str).head(200)
+            if len(sample) == 0:
+                continue
+            parsed = pd.to_datetime(sample, errors="coerce", utc=False)
+            if parsed.notna().mean() >= 0.8:
+                df[c] = pd.to_datetime(df[c], errors="coerce")
+
+    # Column-level profile
+    prof_rows = []
+    for c in df.columns:
+        s = df[c]
+        typ = _series_type_label(s)
+        n = len(s)
+        n_null = int(s.isna().sum())
+        n_nonnull = n - n_null
+        n_unique = int(s.nunique(dropna=True))
+        unique_rate = (n_unique / n_nonnull) if n_nonnull else np.nan
+
+        prof_rows.append({
+            "col": c,
+            "type": typ,
+            "nulls": n_null,
+            "pct_null": (n_null / n) if n else np.nan,
+            "unique": n_unique,
+            "unique_rate_nonnull": unique_rate,
+            "is_probable_id": _is_probably_id(c) or (customer_id_col == c),
+        })
+
+    col_profile = pd.DataFrame(prof_rows).sort_values(["pct_null", "unique_rate_nonnull"], ascending=[False, False])
+    out["column_profile"] = col_profile
+
+    # Duplicates
+    dup_rows = int(df.duplicated().sum())
+    out["duplicate_rows"] = pd.DataFrame([{
+        "duplicate_rows": dup_rows,
+        "pct_duplicate_rows": (dup_rows / len(df)) if len(df) else np.nan
+    }])
+
+    # Customer ID duplication / uniqueness (if provided or inferred)
+    cid = customer_id_col
+    if cid is None:
+        # try to infer a likely id col
+        candidates = col_profile.sort_values(["is_probable_id", "unique_rate_nonnull"], ascending=[False, False])
+        cid = candidates.iloc[0]["col"] if len(candidates) else None
+
+    if cid and cid in df.columns:
+        s = df[cid]
+        out["customer_id_quality"] = pd.DataFrame([{
+            "customer_id_col": cid,
+            "nulls": int(s.isna().sum()),
+            "unique_nonnull": int(s.nunique(dropna=True)),
+            "rows": len(s),
+            "pct_rows_unique_nonnull": (s.nunique(dropna=True) / (len(s) - s.isna().sum())) if (len(s) - s.isna().sum()) else np.nan,
+            "duplicate_ids_nonnull": int(s.duplicated().sum()),
+        }])
+    else:
+        out["customer_id_quality"] = pd.DataFrame([{
+            "customer_id_col": None,
+            "note": "No customer_id_col provided/found."
+        }])
+
+    # Numeric stats
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if num_cols:
+        desc = df[num_cols].describe(percentiles=[0.01, 0.05, 0.5, 0.95, 0.99]).T
+        desc["missing"] = df[num_cols].isna().sum()
+        desc["pct_missing"] = desc["missing"] / len(df)
+        out["numeric_stats"] = desc.reset_index(names="col").sort_values("pct_missing", ascending=False)
+    else:
+        out["numeric_stats"] = pd.DataFrame(columns=["col"])
+
+    # Datetime range
+    dt_cols = df.select_dtypes(include=["datetime64[ns]", "datetime64[ns, UTC]"]).columns.tolist()
+    if dt_cols:
+        dt_rows = []
+        for c in dt_cols:
+            s = df[c]
+            dt_rows.append({
+                "col": c,
+                "min": s.min(),
+                "max": s.max(),
+                "nulls": int(s.isna().sum()),
+                "pct_null": float(s.isna().mean()),
+            })
+        out["datetime_ranges"] = pd.DataFrame(dt_rows).sort_values("pct_null", ascending=False)
+    else:
+        out["datetime_ranges"] = pd.DataFrame(columns=["col", "min", "max", "nulls", "pct_null"])
+
+    # Categorical/text top values
+    cat_cols = [c for c in df.columns if _series_type_label(df[c]) in ("text", "category", "bool")]
+    top_values: Dict[str, pd.DataFrame] = {}
+    for c in cat_cols[:200]:  # avoid blowing up on ultra-wide tables
+        s = df[c]
+        # skip ultra-high cardinality columns unless ID-like
+        if (s.nunique(dropna=True) > 5000) and (not _is_probably_id(c)):
+            continue
+        top_values[c] = _safe_value_counts(s, top_n=top_n)
+
+    out["top_values"] = top_values
+
+    # Quick correlation (numeric only, limited columns)
+    if len(num_cols) >= 2:
+        limited = num_cols[:50]  # cap to avoid huge matrix
+        corr = df[limited].corr(numeric_only=True)
+        out["corr_numeric"] = corr
+    else:
+        out["corr_numeric"] = pd.DataFrame()
+
+    return out
+
+
+# ---------------------------
+# Orchestrator: df or SQL
+# ---------------------------
+
+def run_customer360_eda(
+    data: Union[pd.DataFrame, SQLSource],
+    *,
+    sample_rows: int = 200_000,
+    seed: int = 42,
+    customer_id_col: Optional[str] = None,
+    top_n: int = 10
+) -> Dict[str, Any]:
+    """
+    Main entry point.
+    - If data is SQLSource: pulls a sample + runs pushdown row count & missingness if feasible.
+    - If data is DataFrame: runs profiling directly (optionally sample if huge).
+    """
+    results: Dict[str, Any] = {}
+
+    if isinstance(data, SQLSource):
+        # SQL pushdowns
+        try:
+            results["row_count"] = pd.DataFrame([{"rows_total": data.row_count()}])
+        except Exception as e:
+            results["row_count"] = pd.DataFrame([{"rows_total": None, "error": str(e)}])
+
+        try:
+            results["missingness_sql"] = data.missingness()
+        except Exception as e:
+            results["missingness_sql"] = pd.DataFrame([{"error": str(e)}])
+
+        # Sample to pandas for richer profiling
+        df_sample = data.sample_df(n=sample_rows, seed=seed)
+        results["sample_table_summary"] = pd.DataFrame([{
+            "sample_rows": len(df_sample),
+            "sample_cols": df_sample.shape[1],
+            "sample_memory_mb_est": round(_approx_mem_mb(df_sample), 2)
+        }])
+        results.update({f"sample_{k}": v for k, v in profile_dataframe(
+            df_sample, customer_id_col=customer_id_col, top_n=top_n
+        ).items()})
+
+        return results
+
+    # Pandas DataFrame path
+    df = data
+    if len(df) > sample_rows:
+        df = df.sample(n=sample_rows, random_state=seed)
+        results["note"] = f"Input df had >{sample_rows:,} rows; profiled a sample of {len(df):,}."
+
+    results.update(profile_dataframe(df, customer_id_col=customer_id_col, top_n=top_n))
+    return results
+
+
+# ---------------------------
+# Example usage
+# ---------------------------
+
+if __name__ == "__main__":
+    # ---- Option A: Already have a DataFrame df ----
+    # results = run_customer360_eda(df, customer_id_col="customer_id")
+
+    # ---- Option B: SQL table / query ----
+    # pip install sqlalchemy psycopg2-binary (for Postgres), or pyodbc (for SQL Server), etc.
+    from sqlalchemy import create_engine
+
+    # Example (Postgres):
+    # engine = create_engine("postgresql+psycopg2://user:password@host:5432/dbname")
+    # src = SQLSource(engine=engine, table="customer360", schema="public")
+    # results = run_customer360_eda(src, sample_rows=200_000, customer_id_col="customer_id")
+
+    # Print a few key outputs if you run it
+    # print(results["table_summary"])
+    # print(results["column_profile"].head(25))
+    pass
