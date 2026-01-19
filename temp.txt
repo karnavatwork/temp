@@ -1,3 +1,191 @@
+
+
+import numpy as np
+import pandas as pd
+
+# Join key mapping:
+# - customers unique on: match_id
+# - txns unique on: trd_trd_ref
+# - join customers.match_id  <->  txns.trd_clm_mtch_accnt
+CUST_KEY = "match_id"
+TXN_KEY  = "trd_clm_mtch_accnt"
+TXN_ID_COL = "trd_trd_ref"
+
+txns = txns.copy()
+
+# --- ensure dates are datetime ---
+txns["trd_trd_dt"] = pd.to_datetime(txns["trd_trd_dt"], errors="coerce")          # date
+txns["trd_trd_dttm"] = pd.to_datetime(txns["trd_trd_dttm"], errors="coerce")      # timestamp
+
+# Use trade date (fallback to dttm if dt missing)
+txns["trade_dt"] = txns["trd_trd_dt"]
+txns.loc[txns["trade_dt"].isna(), "trade_dt"] = txns.loc[txns["trade_dt"].isna(), "trd_trd_dttm"].dt.normalize()
+
+# --- helper dates ---
+today = pd.Timestamp.today().normalize()
+d30  = today - pd.Timedelta(days=30)
+d90  = today - pd.Timedelta(days=90)
+d180 = today - pd.Timedelta(days=180)
+d365 = today - pd.Timedelta(days=365)
+
+g = txns.groupby(TXN_KEY, dropna=False)
+
+agg = pd.DataFrame(index=g.size().index)
+
+# =========================================================
+# 1) Core Activity & Engagement Flags
+# =========================================================
+agg["ever_traded_flg"] = (g[TXN_ID_COL].count() > 0).astype(int)
+
+agg["traded_in_2025_flg"] = g["trade_dt"].apply(lambda s: (s.dt.year == 2025).any()).astype(int)
+
+last_trade_dt = g["trade_dt"].max()
+agg["last_trade_dt"] = last_trade_dt
+
+agg["traded_last_30d_flg"] = last_trade_dt.ge(d30).astype(int)
+agg["traded_last_90d_flg"] = last_trade_dt.ge(d90).astype(int)
+agg["inactive_180d_flg"]   = (last_trade_dt.lt(d180) | last_trade_dt.isna()).astype(int)
+
+# =========================================================
+# 2) RFM Features
+# =========================================================
+agg["days_since_last_trade"] = (today - agg["last_trade_dt"]).dt.days
+
+agg["trades_last_30d"] = g["trade_dt"].apply(lambda s: s.ge(d30).sum()).astype("Int64")
+agg["trades_last_90d"] = g["trade_dt"].apply(lambda s: s.ge(d90).sum()).astype("Int64")
+agg["trades_last_1y"]  = g["trade_dt"].apply(lambda s: s.ge(d365).sum()).astype("Int64")
+
+first_trade_dt = g["trade_dt"].min()
+agg["first_trade_dt"] = first_trade_dt
+
+tenure_months = ((today - first_trade_dt).dt.days / 30.44).replace(0, np.nan)
+agg["avg_trades_per_month"] = (g.size() / tenure_months).replace([np.inf, -np.inf], np.nan)
+
+agg["trade_value_last_1y"] = g.apply(lambda d: d.loc[d["trade_dt"].ge(d365), "trd_trd_vl"].sum(min_count=1))
+agg["avg_trade_value"] = g["trd_trd_vl"].mean()
+agg["max_trade_value"] = g["trd_trd_vl"].max()
+
+# =========================================================
+# 3) Buy/Sell Behaviour Signals
+# =========================================================
+agg["buy_trades_cnt"]  = g["trd_trd_flw"].apply(lambda s: (s == "B").sum()).astype("Int64")
+agg["sell_trades_cnt"] = g["trd_trd_flw"].apply(lambda s: (s == "S").sum()).astype("Int64")
+
+agg["buy_sell_ratio"] = (agg["buy_trades_cnt"] / (agg["sell_trades_cnt"].fillna(0) + 1)).astype(float)
+
+agg["only_buy_flg"]  = ((agg["buy_trades_cnt"].fillna(0) > 0) & (agg["sell_trades_cnt"].fillna(0) == 0)).astype(int)
+agg["only_sell_flg"] = ((agg["sell_trades_cnt"].fillna(0) > 0) & (agg["buy_trades_cnt"].fillna(0) == 0)).astype(int)
+
+# =========================================================
+# 4) Product & Instrument Affinity
+# =========================================================
+agg["distinct_stocks_traded"] = g["trd_stck_cd"].nunique(dropna=True).astype("Int64")
+
+agg["top_traded_stock"] = g["trd_stck_cd"].agg(
+    lambda s: s.dropna().mode().iat[0] if not s.dropna().mode().empty else np.nan
+)
+
+agg["single_stock_flg"] = (agg["distinct_stocks_traded"] == 1).astype(int)
+agg["multi_stock_flg"]  = (agg["distinct_stocks_traded"].fillna(0) >= 5).astype(int)  # threshold example: 5+
+
+agg["pref_exchange"] = g["trd_xchng_cd"].agg(
+    lambda s: s.dropna().mode().iat[0] if not s.dropna().mode().empty else np.nan
+)
+
+agg["pref_segment"] = g["trd_xchng_sgmnt_cd"].agg(
+    lambda s: s.dropna().mode().iat[0] if not s.dropna().mode().empty else np.nan
+)
+
+# =========================================================
+# 5) Risk & Value Indicators
+# =========================================================
+# Choose a sensible threshold for your business. Example: INR 1,00,000.
+HIGH_VALUE_THRESHOLD = 100000
+agg["high_value_trade_flg"] = (agg["max_trade_value"].fillna(0) >= HIGH_VALUE_THRESHOLD).astype(int)
+
+agg["margin_blocked_last_90d"] = g.apply(lambda d: d.loc[d["trade_dt"].ge(d90), "trd_amt_blckd"].sum(min_count=1))
+agg["uses_margin_flg"] = (agg["margin_blocked_last_90d"].fillna(0) > 0).astype(int)
+
+agg["active_trade_days"] = g["trade_dt"].agg(lambda s: s.dt.normalize().nunique())
+agg["trade_value_total"] = g["trd_trd_vl"].sum(min_count=1)
+agg["avg_daily_trade_value"] = agg["trade_value_total"] / agg["active_trade_days"].replace(0, np.nan)
+
+# =========================================================
+# 6) Cost & Revenue Features
+# =========================================================
+agg["total_brokerage_lifetime"] = g["trd_brkrg_vl"].sum(min_count=1)
+agg["brokerage_last_90d"] = g.apply(lambda d: d.loc[d["trade_dt"].ge(d90), "trd_brkrg_vl"].sum(min_count=1))
+agg["avg_brokerage_per_trade"] = g["trd_brkrg_vl"].mean()
+agg["zero_brokerage_flg"] = (agg["avg_brokerage_per_trade"].fillna(0) == 0).astype(int)
+
+# Optional extra revenue/charge rollups (derived from available cols; not dropping anything)
+agg["total_trnx_charges_lifetime"] = g["trd_trnx_chrg"].sum(min_count=1)
+agg["total_stamp_duty_lifetime"]   = g["trd_stmp_duty"].sum(min_count=1)
+agg["total_sebi_charges_lifetime"] = g["trd_sebi_chrg_val"].sum(min_count=1)
+agg["total_stt_lifetime"]          = g["trd_stt"].sum(min_count=1)
+agg["total_tax_gst_lifetime"]      = (
+    g["trd_cgst_amt"].sum(min_count=1)
+    + g["trd_sgst_amt"].sum(min_count=1)
+    + g["trd_ugst_amt"].sum(min_count=1)
+    + g["trd_igst_amt"].sum(min_count=1)
+)
+
+# Brokerage composition
+agg["total_fixed_brkg_lifetime"]    = g["trd_fixed_brkg"].sum(min_count=1)
+agg["total_variable_brkg_lifetime"] = g["trd_variable_brkg"].sum(min_count=1)
+
+agg["pref_brkrg_model"] = g["trd_brkrg_mdl"].agg(
+    lambda s: s.dropna().mode().iat[0] if not s.dropna().mode().empty else np.nan
+)
+
+agg["pref_brkrg_type"] = g["trd_brkrg_typ"].agg(
+    lambda s: s.dropna().mode().iat[0] if not s.dropna().mode().empty else np.nan
+)
+
+# =========================================================
+# 7) Compliance & Exception Flags (only where feasible from your columns)
+# =========================================================
+agg["contract_missing_flg"] = g["trd_cntrct_nmbr"].apply(lambda s: s.isna().any()).astype(int)
+
+# Exchange mismatch: if any row has upload/match flag not equal to 'P'
+agg["exchange_mismatch_flg"] = g["trd_upld_mtch_flg"].apply(lambda s: (~s.isin(["P"])).any()).astype(int)
+
+# has_failed_trades_flg: IMPOSSIBLE from the provided columns (no clear success/fail status field)
+agg["has_failed_trades_flg"] = np.nan
+
+# =========================================================
+# Merge into customer 360
+# =========================================================
+customer_360_enriched = customers.merge(
+    agg.reset_index().rename(columns={TXN_KEY: CUST_KEY}),
+    how="left",
+    on=CUST_KEY
+)
+
+# Fill defaults for customers with no trades
+flag_cols = [c for c in customer_360_enriched.columns if c.endswith("_flg")]
+customer_360_enriched[flag_cols] = customer_360_enriched[flag_cols].fillna(0).astype(int)
+
+count_cols = [
+    "trades_last_30d","trades_last_90d","trades_last_1y",
+    "buy_trades_cnt","sell_trades_cnt","distinct_stocks_traded",
+    "active_trade_days"
+]
+for c in count_cols:
+    if c in customer_360_enriched.columns:
+        customer_360_enriched[c] = customer_360_enriched[c].fillna(0).astype(int)
+
+
+
+
+
+===============================================================================
+
+
+
+
+
+
 """
 Large-table-friendly EDA for a Customer 360 table
 - Works with: pandas DataFrame OR SQL table via SQLAlchemy
@@ -436,3 +624,4 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
