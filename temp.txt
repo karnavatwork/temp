@@ -1,6 +1,82 @@
 https://teams.microsoft.com/l/meetup-join/19%3ameeting_NDE1ZWVmZjMtZGQxMC00OTc4LTgxZTYtOTE3NTVjZmM3YTNj%40thread.v2/0?context=%7b%22Tid%22%3a%222dfb2f0b-4d21-4268-9559-72926144c918%22%2c%22Oid%22%3a%22dc04c5a6-2a70-4053-9dff-d4fb039e698f%22%7d
 
 
+X_for_kmeans = Z  # <-- change this ONLY if your kmeans was fit on something else
+
+labels = kmeans.labels_
+centers = kmeans.cluster_centers_
+
+# sanity check (prevents the PCA/centers mismatch error)
+if X_for_kmeans.shape[1] != centers.shape[1]:
+    raise ValueError(
+        f"Mismatch: X_for_kmeans has {X_for_kmeans.shape[1]} features but "
+        f"kmeans centers have {centers.shape[1]} features. "
+        f"Set X_for_kmeans to the exact matrix used to fit kmeans."
+    )
+
+# Use PCA if dense; TruncatedSVD if sparse (works like PCA for visualization)
+is_sparse = hasattr(X_for_kmeans, "tocsr") or "scipy.sparse" in str(type(X_for_kmeans)).lower()
+Reducer = TruncatedSVD if is_sparse else PCA
+
+reducer2 = Reducer(n_components=2, random_state=42)
+reducer3 = Reducer(n_components=3, random_state=42)
+
+X2 = reducer2.fit_transform(X_for_kmeans)
+X3 = reducer3.fit_transform(X_for_kmeans)
+
+# IMPORTANT: transform centers with the SAME fitted reducer2
+C2 = reducer2.transform(centers)
+
+# sample for the 5th plot (keeps it fast)
+n = X2.shape[0]
+sample_n = min(20000, n)
+idx = np.random.default_rng(42).choice(n, size=sample_n, replace=False)
+
+# -----------------------------
+# 5 subplots in one row
+# -----------------------------
+fig, axes = plt.subplots(1, 5, figsize=(26, 5))
+
+def sc(ax, x, y, title):
+    ax.scatter(x, y, c=labels, s=10, alpha=0.7)
+    ax.set_title(title)
+    ax.set_xlabel("Comp 1")
+    ax.set_ylabel("Comp 2")
+
+# 1) 2D (comp1 vs comp2)
+sc(axes[0], X2[:, 0], X2[:, 1], "2D projection (Comp1 vs Comp2)")
+
+# 2) 3D projection: comp1 vs comp3
+sc(axes[1], X3[:, 0], X3[:, 2], "3D proj (Comp1 vs Comp3)")
+
+# 3) 3D projection: comp2 vs comp3
+sc(axes[2], X3[:, 1], X3[:, 2], "3D proj (Comp2 vs Comp3)")
+
+# 4) 2D + centroids
+axes[3].scatter(X2[:, 0], X2[:, 1], c=labels, s=10, alpha=0.5)
+axes[3].scatter(C2[:, 0], C2[:, 1], s=220, marker="X")
+axes[3].set_title("2D + KMeans centroids")
+axes[3].set_xlabel("Comp 1")
+axes[3].set_ylabel("Comp 2")
+
+# 5) 2D sampled
+axes[4].scatter(X2[idx, 0], X2[idx, 1], c=np.asarray(labels)[idx], s=10, alpha=0.7)
+axes[4].set_title(f"2D (sampled {sample_n:,})")
+axes[4].set_xlabel("Comp 1")
+axes[4].set_ylabel("Comp 2")
+
+plt.tight_layout()
+plt.show()
+
+
+
+
+
+================================
+
+
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
@@ -934,6 +1010,7 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
 
 
 
