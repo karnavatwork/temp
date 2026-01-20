@@ -1,3 +1,238 @@
+import numpy as np
+import pandas as pd
+
+# -------------------------------------------------------------------
+# Assumptions / join key:
+# - customers unique on: match_id
+# - MF txns join key: mf_trn_match_acc  (customer account identifier)
+# -------------------------------------------------------------------
+CUST_KEY = "match_id"
+MF_KEY   = "mf_trn_match_acc"
+
+mf = mf_txns.copy()
+
+# --- date parsing (use tran_cr_date as primary transaction date) ---
+for c in [
+    "mf_trn_tran_cr_date","mf_trn_cns_date","mf_trn_updt_date","mf_trn_rej_date",
+    "mf_trn_rev_date","mf_trn_payout_dt","mf_trn_nav_date","mf_trn_download_dt",
+    "mf_trn_man_updt_dt","mf_trn_upg_date","mf_trn_upld_dt","mf_trn_fifo_date",
+    "mf_sipstp_reg_dt","mf_trn_rerun_dt","mf_trn_bse_payout_updt_dt",
+    "mf_trn_tifd_dt","mf_ipd_dob","mf_trn_jh1_dob","mf_trn_jh2_dob"
+]:
+    if c in mf.columns:
+        mf[c] = pd.to_datetime(mf[c], errors="coerce")
+
+mf["trade_dt"] = mf["mf_trn_tran_cr_date"]  # canonical MF txn date
+
+# --- normalize Y/N flags (handles Y/0/1 etc) ---
+def yn_to_bool(x):
+    if pd.isna(x): 
+        return np.nan
+    s = str(x).strip().upper()
+    if s in {"Y", "YES", "1", "TRUE", "T"}: return 1
+    if s in {"N", "NO", "0", "FALSE", "F"}: return 0
+    return np.nan
+
+flag_cols = [
+    "mf_trn_div_reinv_flg","mf_trn_all_redeem_flg","mf_trn_high_val_flg",
+    "mf_trn_download_flg","mf_trn_mail_send_flg","mf_trn_prt_flg",
+    "mf_trn_trg_flg","mf_trn_swtch_flg","mf_trn_trf_swtch_div_reinv_flg",
+    "mf_trn_cst_flg","mf_trn_pwg_trn_flg","mf_trn_txn_slip_flg",
+    "mf_trn_email_flag","mf_iad_pan_verify_flag2","mf_iad_pan_verify_flag3",
+    "mf_iid_vrfy_flg_mfkyc_cmplnt","mf_iid_vrfy_flg_pan_inv_jh1","mf_iid_vrfy_flg_pan_inv_jh2",
+    "mf_exg_valid_pan","mf_exg_valid_guardn_pan","mf_exg_valid_jh1_pan","mf_exg_valid_jh2_pan",
+    "mf_icd_mfocus_indian_flg","mf_trn_off_map_flg","mf_trn_fifo_flg",
+    "mf_trn_rerun_flg","mf_trn_free_insure_flg","mf_trn_freed_flg",
+    "mf_trn_d2us_flg","mf_trn_unblk_flg"
+]
+for c in flag_cols:
+    if c in mf.columns:
+        mf[c] = mf[c].map(yn_to_bool)
+
+# --- helper dates ---
+today = pd.Timestamp.today().normalize()
+d30  = today - pd.Timedelta(days=30)
+d90  = today - pd.Timedelta(days=90)
+d180 = today - pd.Timedelta(days=180)
+d365 = today - pd.Timedelta(days=365)
+
+g = mf.groupby(MF_KEY, dropna=False)
+
+feat = pd.DataFrame(index=g.size().index)
+
+# =========================================================
+# 1) MF Activity & Engagement
+# =========================================================
+feat["mf_ever_transacted_flg"] = (g["mf_trn_id"].count() > 0).astype(int)
+
+feat["mf_traded_2025_flg"] = g["trade_dt"].apply(lambda s: (s.dt.year == 2025).any()).astype(int)
+feat["mf_traded_last_30d_flg"] = g["trade_dt"].apply(lambda s: s.ge(d30).any()).astype(int)
+feat["mf_traded_last_90d_flg"] = g["trade_dt"].apply(lambda s: s.ge(d90).any()).astype(int)
+
+mf_last_tran_date = g["trade_dt"].max()
+feat["mf_last_tran_date"] = mf_last_tran_date
+feat["mf_days_since_last_tran"] = (today - feat["mf_last_tran_date"]).dt.days
+
+feat["mf_inactive_180d_flg"] = (mf_last_tran_date.lt(d180) | mf_last_tran_date.isna()).astype(int)
+feat["mf_total_txns"] = g["mf_trn_id"].count().astype("Int64")
+
+# =========================================================
+# 2) Investment Behaviour & Intent
+# =========================================================
+# SIP/AIP flag: treat 'A' as SIP/AIP based on your value set (A/P/blank)
+feat["mf_sip_user_flg"] = g["mf_trn_aip_flg"].apply(lambda s: (s.astype(str).str.upper() == "A").any()).astype(int)
+feat["mf_sip_txn_cnt"]  = g["mf_trn_aip_flg"].apply(lambda s: (s.astype(str).str.upper() == "A").sum()).astype("Int64")
+
+feat["mf_stp_user_flg"] = g["mf_trn_stp_no"].apply(lambda s: s.notna().any()).astype(int)
+
+# txn code behavior
+feat["mf_purchase_cnt"] = g["mf_trn_cd"].apply(lambda s: (s.astype(str).str.upper() == "P").sum()).astype("Int64")
+feat["mf_redeem_cnt"]   = g["mf_trn_cd"].apply(lambda s: (s.astype(str).str.upper() == "R").sum()).astype("Int64")
+feat["mf_switch_cnt"]   = g["mf_trn_swtch_flg"].apply(lambda s: (s == 1).sum()).astype("Int64")
+
+feat["mf_all_redeem_flg"] = g["mf_trn_all_redeem_flg"].apply(lambda s: (s == 1).any()).astype(int)
+
+# =========================================================
+# 3) Portfolio Depth & Diversification
+# =========================================================
+feat["mf_distinct_schemes"] = g["mf_trn_sch_cd"].nunique(dropna=True).astype("Int64")
+feat["mf_distinct_folios"]  = g["mf_trn_folio"].nunique(dropna=True).astype("Int64")
+
+feat["mf_multi_scheme_flg"]  = (feat["mf_distinct_schemes"].fillna(0) >= 3).astype(int)
+feat["mf_single_scheme_flg"] = (feat["mf_distinct_schemes"].fillna(0) == 1).astype(int)
+
+# =========================================================
+# 4) Value & Wealth Indicators
+# =========================================================
+# invested = sum(mf_trn_amt where trn_cd == 'P')
+feat["mf_total_invested_amt"] = g.apply(
+    lambda d: d.loc[d["mf_trn_cd"].astype(str).str.upper() == "P", "mf_trn_amt"].sum(min_count=1)
+)
+
+# redeemed = sum(mf_trn_amt where trn_cd == 'R')
+feat["mf_total_redeemed_amt"] = g.apply(
+    lambda d: d.loc[d["mf_trn_cd"].astype(str).str.upper() == "R", "mf_trn_amt"].sum(min_count=1)
+)
+
+feat["mf_net_inflow_amt"] = feat["mf_total_invested_amt"].fillna(0) - feat["mf_total_redeemed_amt"].fillna(0)
+feat["mf_avg_ticket_size"] = g["mf_trn_amt"].mean()
+
+feat["mf_current_aum"] = g["mf_trn_aum"].max()
+
+# high value: by flag or AUM threshold
+AUM_HIGH_VALUE_THRESHOLD = 500000  # tune (e.g., 5L); change as needed
+feat["mf_high_value_flg"] = (
+    g["mf_trn_high_val_flg"].apply(lambda s: (s == 1).any())
+    | feat["mf_current_aum"].fillna(0).ge(AUM_HIGH_VALUE_THRESHOLD)
+).astype(int)
+
+# =========================================================
+# 5) Revenue & Cost to Serve
+# =========================================================
+feat["mf_total_brokerage"] = g["mf_trn_brokerage"].sum(min_count=1)
+feat["mf_avg_brokerage_per_txn"] = g["mf_trn_brokerage"].mean()
+
+feat["mf_commission_earned"] = g["mf_trn_comm"].sum(min_count=1)
+feat["mf_total_exit_load"]   = g["mf_trn_exld_amt"].sum(min_count=1)
+feat["mf_total_entry_load"]  = g["mf_trn_enld_amt"].sum(min_count=1)
+
+# =========================================================
+# 6) Risk, Churn & Red Flag Signals
+# =========================================================
+feat["mf_full_exit_flg"] = feat["mf_all_redeem_flg"].astype(int)
+
+feat["mf_recent_redeem_flg_30d"] = g.apply(
+    lambda d: ((d["mf_trn_cd"].astype(str).str.upper() == "R") & d["trade_dt"].ge(d30)).any()
+).astype(int)
+
+feat["mf_recent_redeem_flg_90d"] = g.apply(
+    lambda d: ((d["mf_trn_cd"].astype(str).str.upper() == "R") & d["trade_dt"].ge(d90)).any()
+).astype(int)
+
+# rejected: by status code or rejection mode filled
+FAIL_STATUS_SET = {"F", "R"}  # adjust if your status taxonomy differs
+feat["mf_rejected_txn_flg"] = g.apply(
+    lambda d: (
+        d["mf_trn_status_cd"].astype(str).str.upper().isin(FAIL_STATUS_SET).any()
+        or d["mf_trn_rej_mode"].notna().any()
+    )
+).astype(int)
+
+feat["mf_manual_intervention_flg"] = g["mf_trn_rej_mode"].apply(
+    lambda s: s.astype(str).str.upper().str.contains("MANUAL", na=False).any()
+).astype(int)
+
+# =========================================================
+# 7) Channel & Servicing Load
+# =========================================================
+feat["mf_digital_txn_flg"] = g["mf_trn_channel_id"].apply(
+    lambda s: s.astype(str).str.upper().str.contains("ONLINE", na=False).any()
+).astype(int)
+
+feat["mf_branch_txn_flg"] = g["mf_trn_channel_id"].apply(
+    lambda s: s.astype(str).str.upper().str.contains("BRANCH", na=False).any()
+).astype(int)
+
+feat["mf_rm_assisted_flg"] = g["mf_trn_channel_id"].apply(
+    lambda s: s.astype(str).str.upper().str.contains(r"\bRM\b", na=False).any()
+).astype(int)
+
+# service heavy: update count threshold
+UPD_CNT_THRESHOLD = 3
+feat["mf_service_heavy_flg"] = g["mf_trn_updt_cnt"].apply(lambda s: (s.fillna(0) > UPD_CNT_THRESHOLD).any()).astype(int)
+
+# =========================================================
+# 8) Compliance & KYC Completeness (summary)
+# =========================================================
+feat["mf_kyc_complete_flg"] = g["mf_iid_vrfy_flg_mfkyc_cmplnt"].apply(lambda s: (s == 1).any()).astype(int)
+feat["mf_pan_verified_flg"] = g["mf_exg_valid_pan"].apply(lambda s: (s == 1).any()).astype(int)
+
+# joint holder present: based on jh1/jh2 fields existing (Y/N or code)
+def joint_present(d):
+    j1 = d["mf_trn_jh1"]
+    j2 = d["mf_trn_jh2"]
+    # treat explicit Y/1 as present; if codes exist, any non-null can imply presence
+    return ((j1 == 1).any() or (j2 == 1).any() or j1.notna().any() or j2.notna().any())
+
+feat["mf_joint_holder_flg"] = g.apply(joint_present).astype(int)
+
+# =========================================================
+# Merge into customer 360
+# =========================================================
+customer_360_enriched = customers.merge(
+    feat.reset_index().rename(columns={MF_KEY: CUST_KEY}),
+    how="left",
+    on=CUST_KEY
+)
+
+# Fill defaults for customers with no MF txns
+flag_cols_out = [c for c in customer_360_enriched.columns if c.endswith("_flg")]
+customer_360_enriched[flag_cols_out] = customer_360_enriched[flag_cols_out].fillna(0).astype(int)
+
+count_cols_out = [
+    "mf_total_txns","mf_sip_txn_cnt","mf_purchase_cnt","mf_redeem_cnt","mf_switch_cnt",
+    "mf_distinct_schemes","mf_distinct_folios"
+]
+for c in count_cols_out:
+    if c in customer_360_enriched.columns:
+        customer_360_enriched[c] = customer_360_enriched[c].fillna(0).astype(int)
+
+
+
+
+
+
+
+=========================================================================
+
+
+
+
+
+
+
+
+
 
 
 import numpy as np
@@ -624,4 +859,5 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
 
