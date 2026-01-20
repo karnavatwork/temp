@@ -1,5 +1,78 @@
 https://teams.microsoft.com/l/meetup-join/19%3ameeting_NDE1ZWVmZjMtZGQxMC00OTc4LTgxZTYtOTE3NTVjZmM3YTNj%40thread.v2/0?context=%7b%22Tid%22%3a%222dfb2f0b-4d21-4268-9559-72926144c918%22%2c%22Oid%22%3a%22dc04c5a6-2a70-4053-9dff-d4fb039e698f%22%7d
 
+
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+
+# Inputs expected:
+# - Z: numpy array or scipy sparse matrix of shape (n_samples, n_features) used for clustering
+# - kmeans: fitted KMeans (or you can fit it below)
+# - OPTIONAL: df_clean for hover/labels not needed
+
+# If you DON'T already have a fitted kmeans, uncomment and fit:
+# kmeans = KMeans(n_clusters=10, random_state=42, n_init="auto")
+# kmeans.fit(Z)
+
+labels = kmeans.labels_
+
+# PCA to 2D and 3D (3D used to create multiple 2D projections)
+pca2 = PCA(n_components=2, random_state=42)
+Z_pca2 = pca2.fit_transform(Z.toarray() if hasattr(Z, "toarray") else Z)
+
+pca3 = PCA(n_components=3, random_state=42)
+Z_pca3 = pca3.fit_transform(Z.toarray() if hasattr(Z, "toarray") else Z)
+
+# Helper scatter function
+def scatter2d(x, y, title):
+    plt.figure(figsize=(8, 6))
+    plt.scatter(x, y, c=labels, s=10, alpha=0.7)
+    plt.title(title)
+    plt.xlabel("Component 1")
+    plt.ylabel("Component 2")
+    plt.tight_layout()
+    plt.show()
+
+# 5 x 2D visualizations
+# 1) PCA 2D (PC1 vs PC2)
+scatter2d(Z_pca2[:, 0], Z_pca2[:, 1], "KMeans clusters on Z (PCA 2D: PC1 vs PC2)")
+
+# 2) PCA 3D projection: PC1 vs PC3
+scatter2d(Z_pca3[:, 0], Z_pca3[:, 2], "KMeans clusters on Z (PCA: PC1 vs PC3)")
+
+# 3) PCA 3D projection: PC2 vs PC3
+scatter2d(Z_pca3[:, 1], Z_pca3[:, 2], "KMeans clusters on Z (PCA: PC2 vs PC3)")
+
+# 4) PCA 2D with cluster centers projected into PCA space
+centers = kmeans.cluster_centers_
+centers_pca2 = pca2.transform(centers)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(Z_pca2[:, 0], Z_pca2[:, 1], c=labels, s=10, alpha=0.6)
+plt.scatter(centers_pca2[:, 0], centers_pca2[:, 1], s=200, marker="X")
+plt.title("PCA 2D with KMeans centroids (projected)")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.tight_layout()
+plt.show()
+
+# 5) PCA 2D, but sample points for speed (useful if Z is huge)
+n = Z_pca2.shape[0]
+sample_n = min(20000, n)
+idx = np.random.default_rng(42).choice(n, size=sample_n, replace=False)
+
+plt.figure(figsize=(8, 6))
+plt.scatter(Z_pca2[idx, 0], Z_pca2[idx, 1], c=np.array(labels)[idx], s=10, alpha=0.7)
+plt.title(f"PCA 2D (sampled {sample_n:,} points) - clusters on Z")
+plt.xlabel("PC1")
+plt.ylabel("PC2")
+plt.tight_layout()
+plt.show()
+
+
+
+
 import numpy as np
 import pandas as pd
 
@@ -861,6 +934,7 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
 
 
 
