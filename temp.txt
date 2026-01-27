@@ -1,6 +1,8 @@
+# Karnav meet
 https://teams.microsoft.com/l/meetup-join/19%3ameeting_M2U1NTk2NWQtOGU3Zi00ZmNkLWJlOGYtZTJhMWIxODUwMGNm%40thread.v2/0?context=%7b%22Tid%22%3a%222dfb2f0b-4d21-4268-9559-72926144c918%22%2c%22Oid%22%3a%22dc04c5a6-2a70-4053-9dff-d4fb039e698f%22%7d
 
-
+# VL sync
+https://teams.microsoft.com/l/meetup-join/19%3ameeting_NjlhNGE2Y2UtYWM4MS00MjNlLTkyZjUtY2MyNjcwNzQ4ODkx%40thread.v2/0?context=%7b%22Tid%22%3a%222dfb2f0b-4d21-4268-9559-72926144c918%22%2c%22Oid%22%3a%22dc04c5a6-2a70-4053-9dff-d4fb039e698f%22%7d
 
 import numpy as np
 import pandas as pd
@@ -1276,6 +1278,7 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
 
 
 
