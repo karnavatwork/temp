@@ -1,6 +1,275 @@
 https://teams.microsoft.com/l/meetup-join/19%3ameeting_NDE1ZWVmZjMtZGQxMC00OTc4LTgxZTYtOTE3NTVjZmM3YTNj%40thread.v2/0?context=%7b%22Tid%22%3a%222dfb2f0b-4d21-4268-9559-72926144c918%22%2c%22Oid%22%3a%22dc04c5a6-2a70-4053-9dff-d4fb039e698f%22%7d
 
 
+
+
+
+
+import numpy as np
+import pandas as pd
+
+# -------------------------------------------------------------------
+# Assumptions / join key:
+# - customer 360 unique on: match_id
+# - FNO txns join key: fod_clm_mtch_accnt  (customer account identifier)
+# -------------------------------------------------------------------
+CUST_KEY = "match_id"
+FNO_KEY  = "fod_clm_mtch_accnt"
+
+fno = txns_fno.copy()
+
+# ----------------------------
+# 1) Parse dates / canonical dt
+# ----------------------------
+for c in ["fod_trd_dt", "fod_trd_date", "fod_expry_dt", "fod_ordr_valid_dt"]:
+    if c in fno.columns:
+        fno[c] = pd.to_datetime(fno[c], errors="coerce")
+
+# canonical trade date: prefer fod_trd_dt else fod_trd_date
+fno["trade_dt"] = fno["fod_trd_dt"]
+if "fod_trd_date" in fno.columns:
+    fno.loc[fno["trade_dt"].isna(), "trade_dt"] = fno.loc[fno["trade_dt"].isna(), "fod_trd_date"]
+
+# ----------------------------
+# 2) Normalize flags / codes
+# ----------------------------
+def yn_to_bool(x):
+    if pd.isna(x):
+        return np.nan
+    s = str(x).strip().upper()
+    if s in {"Y", "YES", "1", "TRUE", "T"}: return 1
+    if s in {"N", "NO", "0", "FALSE", "F"}: return 0
+    return np.nan
+
+flag_cols = [
+    "fod_lmt_mrkt_sl_flg", "fod_spl_flag", "fod_fc_flag", "fod_eos_flg",
+    "fod_prcimpv_flg", "fod_setlmnt_flg", "fod_1click_flg", "fod_pro_cli_ind",
+    "fod_is_flg", "fod_spn_flg", "fod_source_flg"
+]
+for c in flag_cols:
+    if c in fno.columns:
+        fno[c] = fno[c].map(yn_to_bool)
+
+# Trade flow normalization (buy/sell)
+if "fod_ordr_flw" in fno.columns:
+    fno["fod_ordr_flw_norm"] = fno["fod_ordr_flw"].astype(str).str.strip().str.upper()
+else:
+    fno["fod_ordr_flw_norm"] = np.nan
+
+# Product / instrument normalization
+for c in ["fod_prdct_typ", "fod_opt_typ", "fod_exer_typ", "fod_xchng_cd", "fod_channel", "fod_mrkt_typ"]:
+    if c in fno.columns:
+        fno[c] = fno[c].astype(str).str.strip().str.upper().replace({"NAN": np.nan})
+
+# Numeric hygiene
+num_cols = [
+    "fod_exec_qty","fod_ordr_tot_qty","fod_cncl_qty","fod_exprd_qty",
+    "fod_trd_val","fod_trd_brkg","fod_amt_blckd","fod_lss_amt_blckd",
+    "fod_diff_amt_blckd","fod_diff_lss_amt_blckd","fod_trail_amt",
+    "fod_span_mrgn","fod_expr_mrgn","fod_oplus_premium","fod_sltp_mrgn",
+    "fod_sltp_pl","fod_sltp_sebi_mrgn","fod_strk_prc","fod_lmt_rt",
+    "fod_lmt_offset","fod_sroll_diff_amt","fod_sroll_lss_amt"
+]
+for c in num_cols:
+    if c in fno.columns:
+        fno[c] = pd.to_numeric(fno[c], errors="coerce")
+
+# ----------------------------
+# 3) Helper dates
+# ----------------------------
+today = pd.Timestamp.today().normalize()
+d30  = today - pd.Timedelta(days=30)
+d90  = today - pd.Timedelta(days=90)
+d180 = today - pd.Timedelta(days=180)
+d365 = today - pd.Timedelta(days=365)
+
+g = fno.groupby(FNO_KEY, dropna=False)
+feat = pd.DataFrame(index=g.size().index)
+
+# =========================================================
+# A) Activity & Engagement
+# =========================================================
+feat["fno_ever_traded_flg"] = (g.size() > 0).astype(int)
+
+last_trade_dt = g["trade_dt"].max()
+first_trade_dt = g["trade_dt"].min()
+
+feat["fno_last_trade_dt"] = last_trade_dt
+feat["fno_first_trade_dt"] = first_trade_dt
+feat["fno_days_since_last_trade"] = (today - feat["fno_last_trade_dt"]).dt.days
+
+feat["fno_traded_last_30d_flg"] = last_trade_dt.ge(d30).astype(int)
+feat["fno_traded_last_90d_flg"] = last_trade_dt.ge(d90).astype(int)
+feat["fno_inactive_180d_flg"]   = (last_trade_dt.lt(d180) | last_trade_dt.isna()).astype(int)
+
+feat["fno_trades_last_30d"] = g["trade_dt"].apply(lambda s: s.ge(d30).sum()).astype("Int64")
+feat["fno_trades_last_90d"] = g["trade_dt"].apply(lambda s: s.ge(d90).sum()).astype("Int64")
+feat["fno_trades_last_1y"]  = g["trade_dt"].apply(lambda s: s.ge(d365).sum()).astype("Int64")
+feat["fno_total_trades"]    = g.size().astype("Int64")
+
+tenure_months = ((today - first_trade_dt).dt.days / 30.44).replace(0, np.nan)
+feat["fno_avg_trades_per_month"] = (g.size() / tenure_months).replace([np.inf, -np.inf], np.nan)
+
+# =========================================================
+# B) Value / Revenue / Cost-to-Serve (proxy from available cols)
+# =========================================================
+feat["fno_trade_value_total"] = g["fod_trd_val"].sum(min_count=1) if "fod_trd_val" in fno.columns else np.nan
+feat["fno_trade_value_last_90d"] = g.apply(
+    lambda d: d.loc[d["trade_dt"].ge(d90), "fod_trd_val"].sum(min_count=1)
+) if "fod_trd_val" in fno.columns else np.nan
+
+feat["fno_avg_trade_value"] = g["fod_trd_val"].mean() if "fod_trd_val" in fno.columns else np.nan
+feat["fno_max_trade_value"] = g["fod_trd_val"].max()  if "fod_trd_val" in fno.columns else np.nan
+
+feat["fno_total_brokerage"] = g["fod_trd_brkg"].sum(min_count=1) if "fod_trd_brkg" in fno.columns else np.nan
+feat["fno_brokerage_last_90d"] = g.apply(
+    lambda d: d.loc[d["trade_dt"].ge(d90), "fod_trd_brkg"].sum(min_count=1)
+) if "fod_trd_brkg" in fno.columns else np.nan
+feat["fno_avg_brokerage_per_trade"] = g["fod_trd_brkg"].mean() if "fod_trd_brkg" in fno.columns else np.nan
+
+# Margin / blocked amount intensity (risk + leverage proxy)
+blocked_cols = [c for c in ["fod_amt_blckd","fod_lss_amt_blckd","fod_diff_amt_blckd","fod_diff_lss_amt_blckd"] if c in fno.columns]
+if blocked_cols:
+    fno["blocked_total"] = fno[blocked_cols].sum(axis=1, min_count=1)
+    feat["fno_margin_blocked_total"] = g["blocked_total"].sum(min_count=1)
+    feat["fno_margin_blocked_last_90d"] = g.apply(lambda d: d.loc[d["trade_dt"].ge(d90), "blocked_total"].sum(min_count=1))
+    feat["fno_uses_margin_flg"] = (feat["fno_margin_blocked_last_90d"].fillna(0) > 0).astype(int)
+else:
+    feat["fno_margin_blocked_total"] = np.nan
+    feat["fno_margin_blocked_last_90d"] = np.nan
+    feat["fno_uses_margin_flg"] = 0
+
+# High-value behavior (tune threshold)
+HIGH_VALUE_THRESHOLD = 100000  # adjust
+feat["fno_high_value_trade_flg"] = (feat["fno_max_trade_value"].fillna(0) >= HIGH_VALUE_THRESHOLD).astype(int)
+
+# =========================================================
+# C) Buy/Sell & Order Quality
+# =========================================================
+feat["fno_buy_trades_cnt"] = g["fod_ordr_flw_norm"].apply(lambda s: (s == "B").sum()).astype("Int64")
+feat["fno_sell_trades_cnt"] = g["fod_ordr_flw_norm"].apply(lambda s: (s == "S").sum()).astype("Int64")
+feat["fno_buy_sell_ratio"] = (feat["fno_buy_trades_cnt"] / (feat["fno_sell_trades_cnt"].fillna(0) + 1)).astype(float)
+
+feat["fno_only_buy_flg"] = ((feat["fno_buy_trades_cnt"].fillna(0) > 0) & (feat["fno_sell_trades_cnt"].fillna(0) == 0)).astype(int)
+feat["fno_only_sell_flg"] = ((feat["fno_sell_trades_cnt"].fillna(0) > 0) & (feat["fno_buy_trades_cnt"].fillna(0) == 0)).astype(int)
+
+# Cancellation / expiry ratios (execution quality / churny intent)
+if "fod_ordr_tot_qty" in fno.columns:
+    tot_qty = g["fod_ordr_tot_qty"].sum(min_count=1)
+    cncl = g["fod_cncl_qty"].sum(min_count=1) if "fod_cncl_qty" in fno.columns else 0
+    exprd = g["fod_exprd_qty"].sum(min_count=1) if "fod_exprd_qty" in fno.columns else 0
+    execq = g["fod_exec_qty"].sum(min_count=1) if "fod_exec_qty" in fno.columns else np.nan
+
+    feat["fno_total_order_qty"] = tot_qty
+    feat["fno_total_exec_qty"] = execq
+    feat["fno_cncl_qty_ratio"] = (cncl / tot_qty.replace(0, np.nan)).astype(float)
+    feat["fno_exprd_qty_ratio"] = (exprd / tot_qty.replace(0, np.nan)).astype(float)
+    feat["fno_exec_fill_ratio"] = (execq / tot_qty.replace(0, np.nan)).astype(float)
+else:
+    feat["fno_total_order_qty"] = np.nan
+    feat["fno_total_exec_qty"] = np.nan
+    feat["fno_cncl_qty_ratio"] = np.nan
+    feat["fno_exprd_qty_ratio"] = np.nan
+    feat["fno_exec_fill_ratio"] = np.nan
+
+# =========================================================
+# D) Product / Strategy Affinity
+# =========================================================
+feat["fno_distinct_underlyings"] = g["fod_undrlyng"].nunique(dropna=True).astype("Int64") if "fod_undrlyng" in fno.columns else np.nan
+feat["fno_distinct_contracts"] = g["fod_cntrctnmbr"].nunique(dropna=True).astype("Int64") if "fod_cntrctnmbr" in fno.columns else np.nan
+
+# product type affinity (top mode)
+feat["fno_pref_product_type"] = g["fod_prdct_typ"].agg(
+    lambda s: s.dropna().mode().iat[0] if "fod_prdct_typ" in fno.columns and not s.dropna().mode().empty else np.nan
+) if "fod_prdct_typ" in fno.columns else np.nan
+
+# option vs futures usage (based on opt_typ presence)
+if "fod_opt_typ" in fno.columns:
+    feat["fno_option_user_flg"] = g["fod_opt_typ"].apply(lambda s: s.notna().any()).astype(int)
+    feat["fno_option_trades_cnt"] = g["fod_opt_typ"].apply(lambda s: s.notna().sum()).astype("Int64")
+else:
+    feat["fno_option_user_flg"] = 0
+    feat["fno_option_trades_cnt"] = pd.Series(0, index=feat.index, dtype="Int64")
+
+# strike / moneyness proxies (only meaningful for options)
+if "fod_strk_prc" in fno.columns and "fod_opt_typ" in fno.columns:
+    feat["fno_avg_strike_price"] = g.apply(
+        lambda d: d.loc[d["fod_opt_typ"].notna(), "fod_strk_prc"].mean()
+    )
+else:
+    feat["fno_avg_strike_price"] = np.nan
+
+# expiry horizon (days to expiry at trade time)
+if "fod_expry_dt" in fno.columns:
+    fno["days_to_expiry"] = (fno["fod_expry_dt"] - fno["trade_dt"]).dt.days
+    feat["fno_avg_days_to_expiry"] = g["days_to_expiry"].mean()
+    feat["fno_short_dte_user_flg"] = g["days_to_expiry"].apply(lambda s: (s.le(7)).any()).astype(int)  # <= 7 days
+else:
+    feat["fno_avg_days_to_expiry"] = np.nan
+    feat["fno_short_dte_user_flg"] = 0
+
+# =========================================================
+# E) Channel & Servicing Load
+# =========================================================
+if "fod_channel" in fno.columns:
+    feat["fno_digital_channel_flg"] = g["fod_channel"].apply(lambda s: s.astype(str).str.contains("ONLINE|WEB|APP|MOBILE", na=False).any()).astype(int)
+    feat["fno_branch_channel_flg"]  = g["fod_channel"].apply(lambda s: s.astype(str).str.contains("BRANCH", na=False).any()).astype(int)
+else:
+    feat["fno_digital_channel_flg"] = 0
+    feat["fno_branch_channel_flg"] = 0
+
+# 1-click / algo usage
+feat["fno_1click_user_flg"] = g["fod_1click_flg"].apply(lambda s: (s == 1).any()).astype(int) if "fod_1click_flg" in fno.columns else 0
+feat["fno_algo_user_flg"]   = g["fod_algo_id"].apply(lambda s: s.notna().any()).astype(int) if "fod_algo_id" in fno.columns else 0
+
+# order modification / ack behavior (proxy for servicing complexity)
+feat["fno_modification_events"] = g["fod_mdfctn_cntr"].max() if "fod_mdfctn_cntr" in fno.columns else np.nan
+feat["fno_service_heavy_flg"] = (
+    (feat["fno_modification_events"].fillna(0) >= 3)
+    | (feat["fno_cncl_qty_ratio"].fillna(0) >= 0.3)
+).astype(int)
+
+# =========================================================
+# F) Compliance / Red-Flag Proxies (limited to available cols)
+# =========================================================
+# missing contract number
+feat["fno_contract_missing_flg"] = g["fod_cntrctnmbr"].apply(lambda s: s.isna().any()).astype(int) if "fod_cntrctnmbr" in fno.columns else np.nan
+
+# price improvement / special flags
+feat["fno_price_improve_flg"] = g["fod_prcimpv_flg"].apply(lambda s: (s == 1).any()).astype(int) if "fod_prcimpv_flg" in fno.columns else 0
+feat["fno_special_flag_flg"]  = g["fod_spl_flag"].apply(lambda s: (s == 1).any()).astype(int) if "fod_spl_flag" in fno.columns else 0
+feat["fno_eos_flag_flg"]      = g["fod_eos_flg"].apply(lambda s: (s == 1).any()).astype(int) if "fod_eos_flg" in fno.columns else 0
+
+# =========================================================
+# 4) Merge into customer 360
+# =========================================================
+customer_360_enriched = customer_360.merge(
+    feat.reset_index().rename(columns={FNO_KEY: CUST_KEY}),
+    how="left",
+    on=CUST_KEY
+)
+
+# Fill defaults for customers with no FNO txns
+flag_out = [c for c in customer_360_enriched.columns if c.endswith("_flg")]
+customer_360_enriched[flag_out] = customer_360_enriched[flag_out].fillna(0).astype(int)
+
+count_out = [c for c in customer_360_enriched.columns if c.endswith("_cnt") or c.endswith("_trades") or c.endswith("_total_trades")]
+for c in count_out:
+    if c in customer_360_enriched.columns:
+        customer_360_enriched[c] = customer_360_enriched[c].fillna(0).astype(int)
+
+
+
+
+
+
+====================================================================================
+
+
+
+
+
+
 X_for_kmeans = Z  # <-- change this ONLY if your kmeans was fit on something else
 
 labels = kmeans.labels_
@@ -1010,6 +1279,7 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
 
 
 
