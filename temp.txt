@@ -4,6 +4,232 @@ https://teams.microsoft.com/l/meetup-join/19%3ameeting_M2U1NTk2NWQtOGU3Zi00ZmNkL
 # VL sync
 https://teams.microsoft.com/l/meetup-join/19%3ameeting_NjlhNGE2Y2UtYWM4MS00MjNlLTkyZjUtY2MyNjcwNzQ4ODkx%40thread.v2/0?context=%7b%22Tid%22%3a%222dfb2f0b-4d21-4268-9559-72926144c918%22%2c%22Oid%22%3a%22dc04c5a6-2a70-4053-9dff-d4fb039e698f%22%7d
 
+
+
+import numpy as np
+import pandas as pd
+from collections import deque
+
+# =========================================================
+# SIMPLE EQUITY PORTFOLIO + P&L FEATURES (FIFO) IN PANDAS
+# =========================================================
+# Assumes equity_txns has these columns (edit only if truly needed):
+#   trd_clm_mtch_accnt  : customer id (join key)
+#   trd_stck_cd         : stock symbol
+#   trd_trd_flw         : BUY/SELL (or B/S)
+#   trd_trd_dt          : trade date
+#   trd_exec_qty        : executed qty
+#   trd_trd_rt          : trade price (optional if trade value present)
+#   trd_trd_vl          : trade value (optional if price present)
+#
+# Output:
+#   customer_360_enriched = customer_360 + portfolio/P&L/concentration features
+# =========================================================
+
+eq = equity_txns.copy()
+
+# ---- basic cleanup / required computed columns ----
+eq["trd_trd_dt"] = pd.to_datetime(eq["trd_trd_dt"], errors="coerce")
+
+eq["side"] = eq["trd_trd_flw"].astype(str).str.strip().str.upper().replace({"B": "BUY", "S": "SELL"})
+eq["qty"] = pd.to_numeric(eq["trd_exec_qty"], errors="coerce")
+eq["price"] = pd.to_numeric(eq.get("trd_trd_rt", np.nan), errors="coerce")
+eq["value"] = pd.to_numeric(eq.get("trd_trd_vl", np.nan), errors="coerce")
+
+# derive missing price/value when possible
+eq.loc[eq["price"].isna() & eq["value"].notna() & eq["qty"].gt(0), "price"] = eq["value"] / eq["qty"]
+eq.loc[eq["value"].isna() & eq["price"].notna() & eq["qty"].gt(0), "value"] = eq["price"] * eq["qty"]
+
+# keep usable rows only
+eq = eq.loc[
+    eq["trd_clm_mtch_accnt"].notna()
+    & eq["trd_stck_cd"].notna()
+    & eq["trd_trd_dt"].notna()
+    & eq["side"].isin(["BUY", "SELL"])
+    & eq["qty"].notna()
+    & eq["qty"].gt(0)
+    & eq["price"].notna()
+].copy()
+
+# signed qty for net position
+eq["signed_qty"] = np.where(eq["side"].eq("BUY"), eq["qty"], -eq["qty"])
+
+# ---------------------------------------------------------
+# FIFO booked P&L per (customer, stock) — simple function
+# ---------------------------------------------------------
+def fifo_pnl(d):
+    d = d.sort_values("trd_trd_dt")
+    lots = deque()  # [qty_remaining, buy_price]
+    pnl = 0.0
+    realized_qty = 0.0
+    realized_buy_cost = 0.0
+    realized_sell_value = 0.0
+
+    for _, r in d.iterrows():
+        q = float(r["qty"])
+        p = float(r["price"])
+        if r["side"] == "BUY":
+            lots.append([q, p])
+        else:  # SELL
+            sell_qty = q
+            realized_sell_value += sell_qty * p
+
+            while sell_qty > 0 and lots:
+                lot_qty, lot_price = lots[0]
+                take = min(sell_qty, lot_qty)
+
+                pnl += take * (p - lot_price)
+                realized_qty += take
+                realized_buy_cost += take * lot_price
+
+                lot_qty -= take
+                sell_qty -= take
+
+                if lot_qty <= 1e-12:
+                    lots.popleft()
+                else:
+                    lots[0][0] = lot_qty
+
+    return pd.Series(
+        {
+            "eq_realized_pnl_fifo": pnl if realized_qty > 0 else np.nan,
+            "eq_realized_buy_cost_fifo": realized_buy_cost if realized_qty > 0 else np.nan,
+            "eq_realized_sell_value_fifo": realized_sell_value if realized_qty > 0 else np.nan,
+            "eq_realized_qty_fifo": realized_qty,
+        }
+    )
+
+# =========================================================
+# 1) CURRENT PORTFOLIO (from net qty + last trade price proxy)
+# =========================================================
+pos = (
+    eq.groupby(["trd_clm_mtch_accnt", "trd_stck_cd"])
+      .agg(
+          net_qty=("signed_qty", "sum"),
+          avg_buy_price=("price", lambda s: s[eq.loc[s.index, "side"].eq("BUY")].mean()),
+          last_trade_price=("price", lambda s: s.loc[eq.loc[s.index, "trd_trd_dt"].idxmax()]),
+          last_trade_dt=("trd_trd_dt", "max"),
+      )
+      .reset_index()
+)
+
+# open positions only
+pos_open = pos.loc[pos["net_qty"] > 0].copy()
+pos_open["mkt_value_proxy"] = pos_open["net_qty"] * pos_open["last_trade_price"]
+pos_open["eq_unrealized_pnl_proxy"] = (pos_open["last_trade_price"] - pos_open["avg_buy_price"]) * pos_open["net_qty"]
+
+# =========================================================
+# 2) BOOKED (REALIZED) P&L (FIFO) at customer level
+# =========================================================
+fifo = (
+    eq.groupby(["trd_clm_mtch_accnt", "trd_stck_cd"])
+      .apply(fifo_pnl)
+      .reset_index()
+)
+
+fifo_cust = (
+    fifo.groupby("trd_clm_mtch_accnt")
+        .agg(
+            eq_realized_pnl_fifo=("eq_realized_pnl_fifo", "sum"),
+            eq_realized_buy_cost_fifo=("eq_realized_buy_cost_fifo", "sum"),
+            eq_realized_sell_value_fifo=("eq_realized_sell_value_fifo", "sum"),
+            eq_realized_qty_fifo=("eq_realized_qty_fifo", "sum"),
+        )
+        .reset_index()
+)
+
+fifo_cust["eq_realized_pnl_ratio_fifo"] = (
+    fifo_cust["eq_realized_pnl_fifo"] / fifo_cust["eq_realized_buy_cost_fifo"].replace(0, np.nan)
+)
+
+# =========================================================
+# 3) CONCENTRATION (top1, top3, HHI) at customer level
+# =========================================================
+if not pos_open.empty:
+    # weights by portfolio value
+    pos_open["w"] = pos_open["mkt_value_proxy"] / pos_open.groupby("trd_clm_mtch_accnt")["mkt_value_proxy"].transform("sum").replace(0, np.nan)
+
+    top1 = (
+        pos_open.sort_values(["trd_clm_mtch_accnt", "mkt_value_proxy"], ascending=[True, False])
+              .groupby("trd_clm_mtch_accnt")
+              .head(1)
+              .loc[:, ["trd_clm_mtch_accnt", "trd_stck_cd", "mkt_value_proxy", "w"]]
+              .rename(columns={"trd_stck_cd": "eq_top_holding_symbol", "mkt_value_proxy": "eq_top_holding_value_proxy"})
+    )
+
+    top3 = (
+        pos_open.sort_values(["trd_clm_mtch_accnt", "mkt_value_proxy"], ascending=[True, False])
+              .groupby("trd_clm_mtch_accnt")
+              .head(3)
+              .groupby("trd_clm_mtch_accnt")["w"]
+              .sum()
+              .rename("eq_top3_concentration_pct")
+              .reset_index()
+    )
+    top3["eq_top3_concentration_pct"] = top3["eq_top3_concentration_pct"] * 100.0
+
+    hhi = (
+        pos_open.groupby("trd_clm_mtch_accnt")["w"]
+                .apply(lambda s: np.nansum((s.values) ** 2))
+                .rename("eq_concentration_hhi")
+                .reset_index()
+    )
+
+    top1["eq_top1_concentration_pct"] = top1["w"] * 100.0
+    top1 = top1.drop(columns=["w"])
+else:
+    top1 = pd.DataFrame(columns=["trd_clm_mtch_accnt", "eq_top_holding_symbol", "eq_top_holding_value_proxy", "eq_top1_concentration_pct"])
+    top3 = pd.DataFrame(columns=["trd_clm_mtch_accnt", "eq_top3_concentration_pct"])
+    hhi  = pd.DataFrame(columns=["trd_clm_mtch_accnt", "eq_concentration_hhi"])
+
+# =========================================================
+# 4) PORTFOLIO SUMMARY (positions, value, unrealized)
+# =========================================================
+portfolio = (
+    pos_open.groupby("trd_clm_mtch_accnt")
+           .agg(
+               eq_open_positions_cnt=("trd_stck_cd", "count"),
+               eq_portfolio_value_proxy=("mkt_value_proxy", "sum"),
+               eq_unrealized_pnl_proxy=("eq_unrealized_pnl_proxy", "sum"),
+               eq_net_units_total=("net_qty", "sum"),
+           )
+           .reset_index()
+)
+
+portfolio["eq_single_stock_portfolio_flg"] = (portfolio["eq_open_positions_cnt"].fillna(0) == 1).astype(int)
+
+# =========================================================
+# 5) FINAL: combine + merge into customer_360
+# =========================================================
+features_eq = (
+    portfolio.merge(fifo_cust, on="trd_clm_mtch_accnt", how="left")
+             .merge(top1, on="trd_clm_mtch_accnt", how="left")
+             .merge(top3, on="trd_clm_mtch_accnt", how="left")
+             .merge(hhi,  on="trd_clm_mtch_accnt", how="left")
+             .rename(columns={"trd_clm_mtch_accnt": "match_id"})
+)
+
+customer_360_enriched = customer_360.merge(features_eq, how="left", on="match_id")
+
+# fill defaults
+for c in [c for c in customer_360_enriched.columns if c.endswith("_flg")]:
+    customer_360_enriched[c] = customer_360_enriched[c].fillna(0).astype(int)
+
+for c in ["eq_open_positions_cnt", "eq_net_units_total"]:
+    if c in customer_360_enriched.columns:
+        customer_360_enriched[c] = customer_360_enriched[c].fillna(0).astype(int)
+
+
+
+
+
+
+
+=======================================================================
+
+
+
+
 import numpy as np
 import pandas as pd
 
@@ -1278,6 +1504,7 @@ results = run_customer360_eda(
     sample_rows=150_000,
     customer_id_col="customer_id"
 )
+
 
 
 
